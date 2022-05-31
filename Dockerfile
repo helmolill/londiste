@@ -1,8 +1,8 @@
 FROM python:3.8-slim-buster
 
-WORKDIR /code
+WORKDIR /londiste
 COPY . .
-RUN pip3 install 'psycopg2-binary==2.8.6' 'pyyaml==5.3.1' 'skytools==3.6.1' 'pgq==3.5'
+RUN pip3 install 'psycopg2-binary==2.8.6' 'pyyaml==5.3.1' 'skytools==3.7.3' 'pgq==3.5'
 RUN pip3 install .
 
 ENV DEBIAN_FRONTEND="noninteractive"
@@ -48,5 +48,5 @@ RUN set -ex; \
     LANG=C initdb data; \
     sed -ri -e "s,^[# ]*(unix_socket_directories).*,\\1='/tmp'," data/postgresql.conf;
 
-ENTRYPOINT ["tests/docker_run.sh"]
+ENTRYPOINT ["/londiste/tests/docker_run.sh"]
 

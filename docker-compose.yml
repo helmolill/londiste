@@ -1,24 +1,30 @@
 #  TODO: put postgres into separate container?
 version: "3.9"
 services:
-  test_obfuscate:
-    build: .
-    volumes:
-      - londiste_test
-    networks:
-      - londiste_test
-    command: ["./obfuscate/docker_run.sh"]
+#  test_obfuscate:
+#    build: .
+#    volumes:
+#      - londiste_test
+#    networks:
+#      - londiste_test
+#    command: ["./obfuscate/docker_run.sh"]
+#
+#  test_simple:
+#    build: .
+#    volumes:
+#      - londiste_test
+#    networks:
+#      - londiste_test
+#    command: ["./simple/docker_run.sh"]
 
-  test_simple:
+  test_execute:
     build: .
+    working_dir: "/tests/execute"
     volumes:
-      - londiste_test
+      - ./tests:/tests
     networks:
       - londiste_test
-    command: ["./simple/docker_run.sh"]
+    command: ["./docker_run.sh"]
 
 networks:
-  londiste_test:
-
-volumes:
   londiste_test:
