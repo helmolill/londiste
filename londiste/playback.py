@@ -6,14 +6,18 @@ import sys
 import time
 import fnmatch
 
-from typing import List, Optional, Dict, Sequence
+from logging import Logger
+from typing import List, Optional, Dict, Sequence, Mapping
 
 import skytools
 
+from skytools.basetypes import DictRow
+
+from pgq.event import Event
 from pgq.cascade.worker import CascadedWorker
 
 from .exec_attrs import ExecAttrs
-from .handler import build_handler, load_handler_modules
+from .handler import build_handler, load_handler_modules, BaseHandler
 
 __all__ = ['Replicator', 'TableState',
            'TABLE_MISSING', 'TABLE_IN_COPY', 'TABLE_CATCHING_UP',
@@ -34,7 +38,7 @@ SYNC_EXIT = 2  # nothing to do, exit script
 MAX_PARALLEL_COPY = 8  # default number of allowed max parallel copy processes
 
 
-def is_data_event(ev):
+def is_data_event(ev: Event) -> bool:
     """Is it insert/update/delete for one table?
     """
     if ev.type in ('I', 'U', 'D'):
@@ -80,7 +84,26 @@ class Counter:
 
 class TableState:
     """Keeps state about one table."""
-    def __init__(self, name, log):
+
+    name: str
+    dest_table: str
+    log: Logger
+    state: int
+    last_snapshot_tick: Optional[int]
+    str_snapshot: Optional[str]
+    from_snapshot: Optional[skytools.Snapshot]
+    sync_tick_id: Optional[int]
+    ok_batch_count: int
+    last_tick: Optional[int]
+    table_attrs: Mapping[str, Optional[str]]
+    copy_role: Optional[str]
+    dropped_ddl: Optional[str]
+    plugin: Optional[BaseHandler]
+    changed: int
+    copy_pos: int
+    max_parallel_copy: int
+
+    def __init__(self, name: str, log: Logger) -> None:
         """Init TableState for one table."""
         self.name = name
         self.dest_table = name
@@ -104,7 +127,7 @@ class TableState:
         # max number of parallel copy processes allowed
         self.max_parallel_copy = MAX_PARALLEL_COPY
 
-    def forget(self):
+    def forget(self) -> None:
         """Reset all info."""
         self.state = TABLE_MISSING
         self.last_snapshot_tick = None
@@ -119,7 +142,7 @@ class TableState:
         self.copy_pos = 0
         self.max_parallel_copy = MAX_PARALLEL_COPY
 
-    def change_snapshot(self, str_snapshot, tag_changed=1):
+    def change_snapshot(self, str_snapshot: Optional[str], tag_changed: int = 1) -> None:
         """Set snapshot."""
         if self.str_snapshot == str_snapshot:
             return
@@ -135,7 +158,7 @@ class TableState:
             self.last_tick = None
             self.changed = 1
 
-    def change_state(self, state, tick_id=None):
+    def change_state(self, state: int, tick_id: Optional[int] = None) -> None:
         """Set state."""
         if self.state == state and self.sync_tick_id == tick_id:
             return
@@ -144,7 +167,7 @@ class TableState:
         self.changed = 1
         self.log.debug("%s: change_state to %s", self.name, self.render_state())
 
-    def render_state(self):
+    def render_state(self) -> Optional[str]:
         """Make a string to be stored in db."""
 
         if self.state == TABLE_MISSING:
@@ -154,14 +177,14 @@ class TableState:
         elif self.state == TABLE_CATCHING_UP:
             return 'catching-up'
         elif self.state == TABLE_WANNA_SYNC:
-            return 'wanna-sync:%d' % self.sync_tick_id
+            return 'wanna-sync:%d' % (self.sync_tick_id or 0)
         elif self.state == TABLE_DO_SYNC:
-            return 'do-sync:%d' % self.sync_tick_id
+            return 'do-sync:%d' % (self.sync_tick_id or 0)
         elif self.state == TABLE_OK:
             return 'ok'
         return None
 
-    def parse_state(self, merge_state):
+    def parse_state(self, merge_state) -> int:
         """Read state from string."""
 
         state = -1
@@ -189,7 +212,7 @@ class TableState:
 
         return state
 
-    def loaded_state(self, row):
+    def loaded_state(self, row: DictRow) -> None:
         """Update object with info from db."""
 
         self.log.debug("loaded_state: %s: %s / %s",
@@ -207,8 +230,10 @@ class TableState:
             self.changed = 1
 
         self.copy_pos = int(row.get('copy_pos', '0'))
-        self.max_parallel_copy = int(self.table_attrs.get('max_parallel_copy',
-                                                          self.max_parallel_copy))
+
+        max_parallel_copy = self.table_attrs.get('max_parallel_copy')
+        if max_parallel_copy:
+            self.max_parallel_copy = int(max_parallel_copy)
 
         if 'dest_table' in row and row['dest_table']:
             self.dest_table = row['dest_table']
@@ -219,11 +244,11 @@ class TableState:
         hstr = self.table_attrs.get('handler', hstr)
         self.plugin = build_handler(self.name, hstr, self.dest_table)
 
-    def max_parallel_copies_reached(self):
-        return self.max_parallel_copy and\
+    def max_parallel_copies_reached(self) -> bool:
+        return self.max_parallel_copy is not None and \
             self.copy_pos >= self.max_parallel_copy
 
-    def interesting(self, ev, tick_id, copy_thread, copy_table_name):
+    def interesting(self, ev: Event, tick_id: int, copy_thread: bool, copy_table_name: str) -> bool:
         """Check if table wants this event."""
 
         if copy_thread:
@@ -254,7 +279,7 @@ class TableState:
                 self.change_snapshot(None)
         return True
 
-    def gc_snapshot(self, copy_thread, prev_tick, cur_tick, no_lag):
+    def gc_snapshot(self, copy_thread: bool, prev_tick: int, cur_tick: int, no_lag: bool) -> None:
         """Remove attached snapshot if possible.
 
         If the event processing is in current moment, the snapshot
@@ -287,7 +312,9 @@ class TableState:
         if self.last_snapshot_tick < prev_tick:
             self.change_snapshot(None)
 
-    def get_plugin(self):
+    def get_plugin(self) -> BaseHandler:
+        if not self.plugin:
+            raise ValueError("no handler set")
         return self.plugin
 
 
@@ -314,7 +341,9 @@ class Replicator(CascadedWorker):
         #threaded_copy_pool_size = 1
 
         # accept only events for locally present tables
-        #local_only = true
+        #local_only = false
+        # do not load EXECUTE events from source queue when local_only is active
+        #local_only_drop_execute = false
 
         ## compare/repair
         # max amount of time table can be locked
@@ -350,14 +379,14 @@ class Replicator(CascadedWorker):
     """
 
     # batch info
-    cur_tick = 0
-    prev_tick = 0
-    copy_table_name = None  # filled by Copytable()
+    cur_tick: int = 0
+    prev_tick: int = 0
+    copy_table_name: Optional[str] = None  # filled by Copytable()
     sql_list: List[str] = []
 
-    current_event = None
+    current_event: Optional[Event] = None
 
-    threaded_copy_tables: List[str]
+    threaded_copy_tables: Sequence[str]
     threaded_copy_pool_size: int
     copy_method_map: Dict[str, Optional[int]]
 
@@ -367,8 +396,13 @@ class Replicator(CascadedWorker):
     register_skip_seqs: Optional[Sequence[str]] = None
 
     local_only: bool = False
+    local_only_drop_execute: bool = False
 
-    def __init__(self, args):
+    table_list: List[TableState]
+    table_map: Dict[str, TableState]
+    used_plugins: Dict[str, BaseHandler]
+
+    def __init__(self, args: Sequence[str]):
         """Replication init."""
         super().__init__('londiste', 'db', args)
 
@@ -395,6 +429,7 @@ class Replicator(CascadedWorker):
         self.register_skip_seqs = self.cf.getlist("register_skip_seqs", [])
 
         self.local_only = self.cf.getboolean('local_only', False)
+        self.local_only_drop_execute = self.cf.getboolean('local_only_drop_execute', False)
 
     def reload(self):
         super().reload()
@@ -411,6 +446,7 @@ class Replicator(CascadedWorker):
         self.register_skip_seqs = self.cf.getlist("register_skip_seqs", [])
 
         self.local_only = self.cf.getboolean('local_only', False)
+        self.local_only_drop_execute = self.cf.getboolean('local_only_drop_execute', False)
 
     def fill_copy_method(self):
         for table_name in self.table_map:
@@ -860,11 +896,16 @@ class Replicator(CascadedWorker):
                 _filterlist = ','.join(map(skytools.quote_literal, self.table_map.keys()))
 
             # build filter
-            meta = "(ev_type like 'pgq.%' or ev_type like 'londiste.%')"
+            cond_list = [
+                "ev_type like 'pgq.%'",
+                "ev_type like 'londiste.%'",
+            ]
+            if not self.local_only_drop_execute:
+                cond_list.append("ev_type = 'EXECUTE'")
             if _filterlist:
-                self.consumer_filter = "(%s or (ev_extra1 in (%s)))" % (meta, _filterlist)
-            else:
-                self.consumer_filter = meta
+                cond_list.append(f"ev_extra1 in ({_filterlist})")
+            expr = " or ".join(cond_list)
+            self.consumer_filter = f"({expr})"
         else:
             # no filter
             self.consumer_filter = None
